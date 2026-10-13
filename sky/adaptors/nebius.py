@@ -5,9 +5,11 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Awaitable, Dict, List, Optional, Tuple
+from typing import (Any, Awaitable, Dict, List, NamedTuple, Optional, Tuple,
+                    Union)
 import urllib.error
 import urllib.request
+import weakref
 
 from sky import sky_logging
 from sky import skypilot_config
@@ -423,7 +425,62 @@ def _imds_bearer(endpoint: str) -> Any:
     return renewable.Bearer(imds.Bearer(endpoint))
 
 
-@annotations.lru_cache(scope='request')
+# SDKs own a loop thread, channel pool and token-renewal task. Dropping a
+# request-scoped cache entry does not release those resources. Reuse clients
+# across requests, serializing construction to avoid concurrent cache misses.
+_SDK_CLOSE_TIMEOUT = 30
+_sdk_lock = threading.Lock()
+
+
+class _SDKHandle:
+    """Keep an SDK alive while service clients, requests or operations use it.
+
+    The SDK's renewal task retains the raw SDK, so finalizing the SDK itself
+    cannot reclaim it. This separate handle is retained by the cache and SDK
+    consumers, but not by the SDK's internal background tasks.
+    """
+
+    def __init__(self, sdk_client: Any) -> None:
+        # Loop creation can trigger GC while holding _loop_lock. Initialize it
+        # before registering any finalizer that could try to acquire that lock.
+        _get_event_loop()
+        self._sdk_client = sdk_client
+        # At interpreter exit the OS reclaims process-owned resources. Do not
+        # attempt to start/join event-loop threads during interpreter shutdown.
+        finalizer = weakref.finalize(self, _close_sdk, sdk_client)
+        # Typeshed declares this writable property as a field outside __slots__.
+        finalizer.atexit = False  # type: ignore[misc]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sdk_client, name)
+
+
+class _SDKCacheEntry(NamedTuple):
+    credential_version: Union[str, Tuple[int, int, int, int]]
+    client: _SDKHandle
+
+
+# (kind, locator, domain). The locator is a normalized path, or the IMDS
+# endpoint for the attached service account.
+_SDKSource = Tuple[str, str, Optional[str]]
+_sdk_cache: Dict[_SDKSource, _SDKCacheEntry] = {}
+_sdk_sources: Dict[Tuple[str, Optional[str]], _SDKSource] = {}
+
+
+async def _close_sdk_async(sdk_client: Any) -> None:
+    try:
+        await asyncio.wait_for(sdk_client.close(), timeout=_SDK_CLOSE_TIMEOUT)
+    except Exception:  # pylint: disable=broad-except
+        logger.warning('Failed to close a cached Nebius SDK.', exc_info=True)
+
+
+def _close_sdk(sdk_client: Any) -> None:
+    # The last reference can disappear on an SDK thread or an async caller's
+    # loop. Never block that thread while waiting for the SDK to shut down.
+    asyncio.run_coroutine_threadsafe(_close_sdk_async(sdk_client),
+                                     _get_event_loop())
+
+
 def _sdk(token: Optional[str],
          cred_path: Optional[str],
          vm_token_path: Optional[str] = None,
@@ -433,41 +490,91 @@ def _sdk(token: Optional[str],
     assert [token, cred_path, vm_token_path, vm_imds_endpoint
            ].count(None) == 3, (token, cred_path, vm_token_path,
                                 vm_imds_endpoint)
+    domain = api_domain()
+    kind: str
+    locator: str
     if vm_imds_endpoint is not None:
-        # The bearer caches the token and refreshes it ahead of its expiry.
-        return nebius.sdk.SDK(credentials=_imds_bearer(vm_imds_endpoint),
-                              domain=api_domain(),
-                              user_agent_prefix=_user_agent_prefix())
-    if token is not None:
-        return nebius.sdk.SDK(credentials=token,
-                              domain=api_domain(),
-                              user_agent_prefix=_user_agent_prefix())
-    if vm_token_path is not None:
-        # The platform rotates this token; the SDK's file bearer re-reads it.
-        # pylint: disable=import-outside-toplevel
-        from nebius.aio.token import file as token_file
-        return nebius.sdk.SDK(credentials=token_file.Bearer(vm_token_path),
-                              domain=api_domain(),
-                              user_agent_prefix=_user_agent_prefix())
-    if cred_path is not None:
-        return nebius.sdk.SDK(
-            credentials_file_name=os.path.expanduser(cred_path),
-            domain=api_domain(),
-            user_agent_prefix=_user_agent_prefix(),
-        )
-    raise ValueError('Either token or credentials file path must be provided')
+        kind, locator = 'vm_imds', vm_imds_endpoint
+    elif vm_token_path is not None:
+        kind = 'vm_token_file'
+        locator = os.path.abspath(os.path.expanduser(vm_token_path))
+    elif token is not None:
+        kind = 'token'
+        locator = os.path.abspath(os.path.expanduser(iam_token_path()))
+    else:
+        assert cred_path is not None
+        kind = 'credentials_file'
+        locator = os.path.abspath(os.path.expanduser(cred_path))
+    source = (kind, locator, domain)
+    owner = (skypilot_config.get_active_workspace(), domain)
+    with _sdk_lock:
+        credential_version: Union[str, Tuple[int, int, int, int]]
+        if token is not None:
+            credential_version = token
+        elif kind == 'credentials_file':
+            # The SDK reads service-account credentials only at construction.
+            # Preserve credential refresh when a file is edited or replaced.
+            stat = os.stat(locator)
+            credential_version = (stat.st_ino, stat.st_size, stat.st_mtime_ns,
+                                  stat.st_ctime_ns)
+        else:
+            # The attached service account's bearers fetch and refresh the
+            # token themselves, so the SDK never needs to be rebuilt for a
+            # rotated token. Keying on the file's stat would leak an SDK per
+            # rotation.
+            credential_version = locator
+        entry = _sdk_cache.get(source)
+        if (entry is None or entry.credential_version != credential_version):
+            if kind == 'vm_imds':
+                # The bearer caches the token and refreshes it ahead of its
+                # expiry.
+                sdk_client = nebius.sdk.SDK(
+                    credentials=_imds_bearer(locator),
+                    domain=domain,
+                    user_agent_prefix=_user_agent_prefix())
+            elif kind == 'vm_token_file':
+                # The platform rotates this token; the SDK's file bearer
+                # re-reads it.
+                # pylint: disable=import-outside-toplevel
+                from nebius.aio.token import file as token_file
+                sdk_client = nebius.sdk.SDK(
+                    credentials=token_file.Bearer(locator),
+                    domain=domain,
+                    user_agent_prefix=_user_agent_prefix())
+            elif token is not None:
+                sdk_client = nebius.sdk.SDK(
+                    credentials=token,
+                    domain=domain,
+                    user_agent_prefix=_user_agent_prefix())
+            else:
+                sdk_client = nebius.sdk.SDK(
+                    credentials_file_name=locator,
+                    domain=domain,
+                    user_agent_prefix=_user_agent_prefix())
+            entry = _SDKCacheEntry(credential_version, _SDKHandle(sdk_client))
+            _sdk_cache[source] = entry
+
+        # A source switch (e.g. adding/removing the IAM token file, or the
+        # IMDS becoming available) must also retire the previous client,
+        # unless another workspace still selects it.
+        previous_source = _sdk_sources.get(owner)
+        _sdk_sources[owner] = source
+        if (previous_source is not None and previous_source != source and
+                previous_source not in _sdk_sources.values()):
+            _sdk_cache.pop(previous_source, None)
+        return entry.client
 
 
 def clear_sdk_cache() -> None:
-    """Drops the cached SDK client.
+    """Retire cached SDKs without interrupting their existing consumers.
 
-    The SDK is cached per credentials and holds grpc.aio channels bound to the
-    event loop that first used them. `asyncio.run()` closes the loop it
-    creates, and once a request has failed on such a channel, later calls from
-    a fresh loop raise "Event loop is closed". Callers that drive more than one
-    `asyncio.run()` cycle in a single process must reset the client in between.
+    SDKs close asynchronously after the last service client, request or
+    operation releases its handle. The catalog fetcher calls this between
+    asyncio.run() cycles; concurrent callers can safely finish on retired SDKs.
     """
-    _sdk.cache_clear()
+    with _sdk_lock:
+        _sdk_cache.clear()
+        _sdk_sources.clear()
 
 
 def clear_imds_probe_cache() -> None:
