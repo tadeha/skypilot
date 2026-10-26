@@ -56,6 +56,25 @@ To verify that the service account credentials are working with SkyPilot, run th
 
 * The `NEBIUS_IAM_TOKEN` file, if present, will take priority for authentication.
 
+Attaching a service account to VMs
+----------------------------------
+
+To run SkyPilot VMs as an existing Nebius service account instead of uploading
+your local credentials to them, set ``nebius.remote_identity`` to the service
+account ID (see :ref:`config-yaml-nebius-remote-identity`):
+
+.. code-block:: yaml
+
+    nebius:
+      remote_identity: serviceaccount-e00xxxxxxxxxxx
+
+Workloads on the VMs can then get a token for this service account from the
+instance metadata service, for example to access other clouds through
+`workload identity federation <https://docs.nebius.com/iam/wif>`_.
+
+If the jobs controller runs on Nebius with an attached service account, also
+set ``nebius.tenant_id`` in the config, as the tenant ID file is not uploaded.
+
 Using internal IPs
 -----------------------
 For security reason, users may only want to use internal IPs for SkyPilot instances.
