@@ -1566,6 +1566,35 @@ _REMOTE_IDENTITY_SCHEMA = {
     }
 }
 
+# Nebius: one of the modes above, or the ID of an existing service account to
+# attach to the VMs. `pattern` (unlike `case_insensitive_enum`) ignores
+# non-string values, so this can sit in an `anyOf` with the list form.
+_NEBIUS_REMOTE_IDENTITY_VALUE_SCHEMA = {
+    'type': 'string',
+    'pattern':
+        ('^((?i:' + '|'.join(option.value
+                             for option in RemoteIdentityOptions
+                             if option is not RemoteIdentityOptions.NONE) +
+         ')|serviceaccount-[a-z0-9]+)$'),
+}
+
+_REMOTE_IDENTITY_SCHEMA_NEBIUS = {
+    'anyOf': [
+        _NEBIUS_REMOTE_IDENTITY_VALUE_SCHEMA,
+        {
+            # A list of single-element dicts mapping cluster name patterns
+            # to identities, as for aws.remote_identity.
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'additionalProperties': _NEBIUS_REMOTE_IDENTITY_VALUE_SCHEMA,
+                'maxProperties': 1,
+                'minProperties': 1,
+            },
+        },
+    ]
+}
+
 _REMOTE_IDENTITY_SCHEMA_KUBERNETES = {
     'remote_identity': {
         'anyOf': [{
@@ -2568,6 +2597,7 @@ def get_config_schema():
                             'project_id': {
                                 'type': 'string',
                             },
+                            'remote_identity': _REMOTE_IDENTITY_SCHEMA_NEBIUS,
                             'subnet_id': {
                                 'type': 'string',
                             },
@@ -3039,6 +3069,7 @@ def get_config_schema():
                         'disabled': {
                             'type': 'boolean'
                         },
+                        'remote_identity': _REMOTE_IDENTITY_SCHEMA_NEBIUS,
                     },
                     'additionalProperties': False,
                 },
@@ -3195,6 +3226,9 @@ def get_config_schema():
                 {'remote_identity': _PROPERTY_NAME_OR_CLUSTER_NAME_TO_PROPERTY})
         elif cloud == 'kubernetes':
             config['properties'].update(_REMOTE_IDENTITY_SCHEMA_KUBERNETES)
+        elif cloud == 'nebius':
+            config['properties'].update(
+                {'remote_identity': _REMOTE_IDENTITY_SCHEMA_NEBIUS})
         else:
             config['properties'].update(_REMOTE_IDENTITY_SCHEMA)
 

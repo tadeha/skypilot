@@ -92,6 +92,12 @@ def domain_path() -> str:
     return '~/.nebius/NEBIUS_DOMAIN.txt'
 
 
+# Token of the service account attached to a Nebius VM, kept fresh by the
+# platform. https://docs.nebius.com/cli/compute-vm
+VM_SERVICE_ACCOUNT_TOKEN_DIR = '/mnt/cloud-metadata'
+VM_SERVICE_ACCOUNT_TOKEN_PATH = f'{VM_SERVICE_ACCOUNT_TOKEN_DIR}/token'
+
+
 def credentials_path() -> str:
     workspace_path = skypilot_config.get_workspace_cloud('nebius').get(
         'credentials_file_path', None)
@@ -266,7 +272,8 @@ def get_iam_token():
 
 def is_token_or_cred_file_exist():
     return (os.path.exists(os.path.expanduser(iam_token_path())) or
-            os.path.exists(os.path.expanduser(credentials_path())))
+            os.path.exists(os.path.expanduser(credentials_path())) or
+            os.path.exists(VM_SERVICE_ACCOUNT_TOKEN_PATH))
 
 
 def get_tenant_id():
@@ -293,6 +300,9 @@ def sdk():
     1. Credentials file specified in workspace config, if set
     2. IAM token file, if set
     3. Default credentials path
+    4. Token of the service account attached to this Nebius VM, if the
+       default credentials file does not exist (e.g. a VM launched with
+       `nebius.remote_identity: serviceaccount-...`)
     """
     # 1. Check if credentials path is set in workspace config (highest priority)
     workspace_cred_path = _get_workspace_credentials_path()
@@ -313,6 +323,10 @@ def sdk():
 
     # 3. Fall back to default credentials path (lowest priority)
     default_cred_path = _get_default_credentials_path()
+    if (not os.path.exists(os.path.expanduser(default_cred_path)) and
+            os.path.exists(VM_SERVICE_ACCOUNT_TOKEN_PATH)):
+        # 4. Running on a Nebius VM with an attached service account.
+        return _sdk(None, None, vm_token_path=VM_SERVICE_ACCOUNT_TOKEN_PATH)
     return _sdk(None, default_cred_path)
 
 
@@ -377,19 +391,29 @@ def _close_sdk(sdk_client: Any) -> None:
                                      _get_event_loop())
 
 
-def _sdk(token: Optional[str], cred_path: Optional[str]):
-    # Exactly one of token or cred_path must be provided.
-    assert (token is None) != (cred_path is None), (token, cred_path)
+def _sdk(token: Optional[str],
+         cred_path: Optional[str],
+         vm_token_path: Optional[str] = None):
+    # Exactly one of token, cred_path or vm_token_path must be provided.
+    assert [token, cred_path,
+            vm_token_path].count(None) == 2, (token, cred_path, vm_token_path)
     domain = api_domain()
-    source_path = os.path.abspath(
-        os.path.expanduser(
-            cred_path if cred_path is not None else iam_token_path()))
+    if vm_token_path is not None:
+        source_path = vm_token_path
+    else:
+        source_path = os.path.abspath(
+            os.path.expanduser(
+                cred_path if cred_path is not None else iam_token_path()))
     source = (token is not None, source_path, domain)
     owner = (skypilot_config.get_active_workspace(), domain)
     with _sdk_lock:
         credential_version: Union[str, Tuple[int, int, int, int]]
         if token is not None:
             credential_version = token
+        elif vm_token_path is not None:
+            # The platform rotates this token; the SDK's file bearer re-reads
+            # it, so one client is reused across rotations.
+            credential_version = vm_token_path
         else:
             # The SDK reads service-account credentials only at construction.
             # Preserve credential refresh when a file is edited or replaced.
@@ -401,6 +425,13 @@ def _sdk(token: Optional[str], cred_path: Optional[str]):
             if token is not None:
                 sdk_client = nebius.sdk.SDK(
                     credentials=token,
+                    domain=domain,
+                    user_agent_prefix=_user_agent_prefix())
+            elif vm_token_path is not None:
+                # pylint: disable=import-outside-toplevel
+                from nebius.aio.token import file as token_file
+                sdk_client = nebius.sdk.SDK(
+                    credentials=token_file.Bearer(vm_token_path),
                     domain=domain,
                     user_agent_prefix=_user_agent_prefix())
             else:
