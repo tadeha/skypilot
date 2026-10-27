@@ -72,6 +72,12 @@ Workloads on the VMs can then get a token for this service account from the
 instance metadata service, for example to access other clouds through
 `workload identity federation <https://docs.nebius.com/iam/wif>`_.
 
+SkyPilot on the VMs (for example for autostop and autodown) authenticates as this
+service account with the token served by the instance metadata service
+(``http://metadata.nebius.internal/v1/iam/sa/token``). On older VM images that
+still have the legacy ``/mnt/cloud-metadata/token`` file (Nebius removed this
+mount on September 30, 2026), the file is used as a fallback.
+
 If the jobs controller runs on Nebius with an attached service account, also
 set ``nebius.tenant_id`` in the config, as the tenant ID file is not uploaded.
 

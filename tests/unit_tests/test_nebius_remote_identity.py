@@ -1,8 +1,14 @@
 """Tests for attaching a service account via `nebius.remote_identity`."""
 # pylint: disable=protected-access
+import asyncio
+import datetime
+import http.server
 import importlib.util
+import json
 import os
 import pathlib
+import sys
+import threading
 from unittest import mock
 
 import jinja2
@@ -365,12 +371,20 @@ def test_launch_sets_instance_service_account(service_account_id):
     assert request.spec.service_account_id == (service_account_id or '')
 
 
+def _innermost_bearer(bearer):
+    """The bearer wrapped by renewable/metrics wrappers."""
+    while getattr(bearer, 'wrapped', None) is not None:
+        bearer = bearer.wrapped
+    return bearer
+
+
 class TestAdaptorVmServiceAccountToken:
     """SDK auth with the token of an attached service account."""
 
     @pytest.fixture(name='sdk_factory')
     def fixture_sdk_factory(self, monkeypatch, tmp_path):
         nebius_adaptor.clear_sdk_cache()
+        nebius_adaptor.clear_imds_probe_cache()
         monkeypatch.setattr(nebius_adaptor, 'api_domain', lambda: None)
         monkeypatch.setattr(nebius_adaptor.skypilot_config,
                             'get_active_workspace', lambda: 'default')
@@ -383,16 +397,75 @@ class TestAdaptorVmServiceAccountToken:
         token_path = tmp_path / 'token'
         monkeypatch.setattr(nebius_adaptor, 'VM_SERVICE_ACCOUNT_TOKEN_PATH',
                             str(token_path))
+        # No metadata service unless a test enables it.
+        probe = mock.MagicMock(return_value=False)
+        monkeypatch.setattr(nebius_adaptor, '_probe_imds', probe)
         factory = mock.MagicMock()
         monkeypatch.setattr(nebius_adaptor, 'nebius', factory)
-        yield factory.sdk.SDK, tmp_path
+        yield factory.sdk.SDK, tmp_path, probe
         nebius_adaptor.clear_sdk_cache()
+        nebius_adaptor.clear_imds_probe_cache()
 
     @nebius_sdk_required
-    def test_uses_vm_token_without_credentials_file(self, sdk_factory):
+    def test_uses_imds_without_credentials_file(self, sdk_factory):
+        # pylint: disable=import-outside-toplevel
+        from nebius.aio.token import renewable
+        factory, tmp_path, probe = sdk_factory
+        probe.return_value = True
+        # The legacy file does not matter when the metadata service works.
+        (tmp_path / 'token').write_text('vm-token')
+
+        assert nebius_adaptor.is_token_or_cred_file_exist()
+        nebius_adaptor.sdk()
+        nebius_adaptor.sdk()
+
+        # One SDK (and bearer) per process, one probe.
+        factory.assert_called_once()
+        probe.assert_called_once()
+        bearer = factory.call_args.kwargs['credentials']
+        assert isinstance(bearer, renewable.Bearer)
+        assert _innermost_bearer(bearer).name == (
+            f'imds:{nebius_adaptor.VM_SERVICE_ACCOUNT_TOKEN_ENDPOINT}')
+
+    @nebius_sdk_required
+    def test_uses_sdk_imds_bearer_when_available(self, sdk_factory):
+        # pylint: disable=import-outside-toplevel
+        pytest.importorskip('nebius.aio.token.imds')
+        from nebius.aio.token import imds
+        factory, _, probe = sdk_factory
+        probe.return_value = True
+
+        nebius_adaptor.sdk()
+
+        bearer = factory.call_args.kwargs['credentials']
+        assert isinstance(_innermost_bearer(bearer), imds.Bearer)
+
+    @nebius_sdk_required
+    def test_local_imds_bearer_without_sdk_imds_module(self, sdk_factory,
+                                                       monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        from nebius.aio.token import renewable
+
+        from sky.adaptors import nebius_imds
+
+        # Simulate nebius<0.6.24, which has no nebius.aio.token.imds.
+        # `from package import module` prefers an already imported attribute.
+        monkeypatch.delattr('nebius.aio.token.imds', raising=False)
+        monkeypatch.setitem(sys.modules, 'nebius.aio.token.imds', None)
+        factory, _, probe = sdk_factory
+        probe.return_value = True
+
+        nebius_adaptor.sdk()
+
+        bearer = factory.call_args.kwargs['credentials']
+        assert isinstance(bearer, renewable.Bearer)
+        assert isinstance(_innermost_bearer(bearer), nebius_imds.Bearer)
+
+    @nebius_sdk_required
+    def test_falls_back_to_token_file(self, sdk_factory):
         # pylint: disable=import-outside-toplevel
         from nebius.aio.token import file as token_file
-        factory, tmp_path = sdk_factory
+        factory, tmp_path, probe = sdk_factory
         (tmp_path / 'token').write_text('vm-token')
 
         assert nebius_adaptor.is_token_or_cred_file_exist()
@@ -400,19 +473,201 @@ class TestAdaptorVmServiceAccountToken:
         nebius_adaptor.sdk()
 
         factory.assert_called_once()
+        probe.assert_called_once()
         bearer = factory.call_args.kwargs['credentials']
         assert isinstance(bearer, token_file.Bearer)
 
-    def test_credentials_file_takes_precedence(self, sdk_factory):
-        factory, tmp_path = sdk_factory
-        (tmp_path / 'token').write_text('vm-token')
+    @pytest.mark.parametrize('with_token_file', [False, True])
+    def test_credentials_file_takes_precedence(self, sdk_factory,
+                                               with_token_file):
+        factory, tmp_path, probe = sdk_factory
+        probe.return_value = True
+        if with_token_file:
+            (tmp_path / 'token').write_text('vm-token')
         (tmp_path / 'credentials.json').write_text('{}')
 
         nebius_adaptor.sdk()
 
         assert factory.call_args.kwargs['credentials_file_name'] == str(
             tmp_path / 'credentials.json')
+        # Off a VM with credentials, the metadata service is never contacted.
+        probe.assert_not_called()
 
     def test_no_credentials(self, sdk_factory):
         del sdk_factory
         assert not nebius_adaptor.is_token_or_cred_file_exist()
+
+    def test_failed_probe_is_cached_for_a_while(self, sdk_factory, monkeypatch):
+        _, _, probe = sdk_factory
+        now = [1000.0]
+        monkeypatch.setattr(nebius_adaptor.time, 'monotonic', lambda: now[0])
+
+        assert not nebius_adaptor.is_imds_available()
+        assert not nebius_adaptor.is_imds_available()
+        probe.assert_called_once()
+
+        now[0] += nebius_adaptor._IMDS_PROBE_FAILURE_TTL + 1
+        probe.return_value = True
+        assert nebius_adaptor.is_imds_available()
+        assert probe.call_count == 2
+
+        # A successful probe is kept.
+        now[0] += 10 * nebius_adaptor._IMDS_PROBE_FAILURE_TTL
+        assert nebius_adaptor.is_imds_available()
+        assert probe.call_count == 2
+
+
+class TestImdsProbe:
+    """The probe of the instance metadata service."""
+
+    @staticmethod
+    def _response(body):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = body
+        return response
+
+    @pytest.mark.parametrize('body, expected', [
+        (b'{"access_token": "t", "expires_at": "2026-10-01T00:00:00Z"}', True),
+        (b'{"expires_at": "2026-10-01T00:00:00Z"}', False),
+        (b'not json', False),
+        (b'[]', False),
+    ])
+    def test_response(self, body, expected):
+        opener = mock.MagicMock()
+        opener.open.return_value = self._response(body)
+        with mock.patch.object(nebius_adaptor.urllib.request,
+                               'build_opener',
+                               return_value=opener):
+            assert nebius_adaptor._probe_imds() is expected
+        request = opener.open.call_args.args[0]
+        assert request.full_url == (
+            nebius_adaptor.VM_SERVICE_ACCOUNT_TOKEN_ENDPOINT)
+        assert request.get_header('Metadata') == 'true'
+        assert opener.open.call_args.kwargs['timeout'] <= 1
+
+    @pytest.mark.parametrize('error', [
+        nebius_adaptor.urllib.error.URLError('no such host'),
+        TimeoutError(),
+        ConnectionRefusedError(),
+    ])
+    def test_unreachable(self, error):
+        opener = mock.MagicMock()
+        opener.open.side_effect = error
+        with mock.patch.object(nebius_adaptor.urllib.request,
+                               'build_opener',
+                               return_value=opener):
+            assert not nebius_adaptor._probe_imds()
+
+
+@nebius_sdk_required
+class TestLocalImdsBearer:
+    """The fallback IMDS bearer used with nebius<0.6.24."""
+
+    def test_parses_token(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.adaptors import nebius_imds
+        tok = nebius_imds._parse_token(
+            b'{"access_token": "abc", "expires_at": "2026-10-01T10:00:00Z"}')
+        assert tok.token == 'abc'
+        assert tok.expiration == datetime.datetime(2026,
+                                                   10,
+                                                   1,
+                                                   10,
+                                                   tzinfo=datetime.timezone.utc)
+
+    @pytest.mark.parametrize('body', [
+        b'',
+        b'[]',
+        b'{"access_token": "", "expires_at": "2026-10-01T10:00:00Z"}',
+        b'{"access_token": "abc"}',
+        b'{"access_token": "abc", "expires_at": "tomorrow"}',
+    ])
+    def test_rejects_invalid_response(self, body):
+        # pylint: disable=import-outside-toplevel
+        from sky.adaptors import nebius_imds
+        with pytest.raises(nebius_imds.IMDSError):
+            nebius_imds._parse_token(body)
+
+    @staticmethod
+    def _serve(statuses):
+        """Starts a local HTTP server answering with the given statuses."""
+        requests = []
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            """Answers every GET with the next configured status."""
+
+            def do_GET(self):  # pylint: disable=invalid-name
+                requests.append(self.headers.get('Metadata'))
+                status = statuses[min(len(requests), len(statuses)) - 1]
+                body = json.dumps({
+                    'access_token': 'abc',
+                    'expires_at': '2026-10-01T10:00:00Z'
+                } if status == 200 else {}).encode()
+                self.send_response(status)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):  # pylint: disable=arguments-differ
+                pass
+
+        server = http.server.HTTPServer(('127.0.0.1', 0), _Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, requests
+
+    def test_renewable_wrapper_caches_token(self):
+        # pylint: disable=import-outside-toplevel
+        from nebius.aio.token import renewable
+
+        from sky.adaptors import nebius_imds
+        server, requests = self._serve([200])
+        try:
+            bearer = renewable.Bearer(
+                nebius_imds.Bearer(
+                    f'http://127.0.0.1:{server.server_port}/v1/iam/sa/token'))
+
+            async def fetch_twice():
+                try:
+                    first = await bearer.receiver().fetch(timeout=10)
+                    second = await bearer.receiver().fetch(timeout=10)
+                    return first, second
+                finally:
+                    await bearer.close()
+
+            first, second = asyncio.run(fetch_twice())
+            assert first.token == second.token == 'abc'
+            assert len(requests) == 1
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    @pytest.mark.parametrize('statuses, expect_token', [
+        ([200], True),
+        ([429, 503, 200], True),
+        ([429, 429, 429], False),
+        ([403], False),
+    ])
+    def test_fetch_retries(self, statuses, expect_token):
+        # pylint: disable=import-outside-toplevel
+        from sky.adaptors import nebius_imds
+        server, requests = self._serve(statuses)
+        try:
+            bearer = nebius_imds.Bearer(
+                f'http://127.0.0.1:{server.server_port}/v1/iam/sa/token')
+
+            async def fetch():
+                return await bearer.receiver().fetch(timeout=10)
+
+            if expect_token:
+                assert asyncio.run(fetch()).token == 'abc'
+            else:
+                with pytest.raises(nebius_imds.IMDSError):
+                    asyncio.run(fetch())
+            # Only 429 and 5xx are retried, up to 3 attempts.
+            assert len(requests) == (len(statuses)
+                                     if statuses != [429, 429, 429] else 3)
+            assert set(requests) == {'true'}
+        finally:
+            server.shutdown()
+            server.server_close()
