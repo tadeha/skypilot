@@ -3154,7 +3154,13 @@ Supported values:
    including SkyPilot's autostop, authenticates as this service account. This
    also enables `workload identity federation
    <https://docs.nebius.com/iam/wif>`_ to other clouds without copying any
-   credentials to the VMs.
+   credentials to the VMs. The VM's SkyPilot gets the service account's token
+   from the Nebius instance metadata service
+   (``http://metadata.nebius.internal/v1/iam/sa/token``), falling back to the
+   legacy ``/mnt/cloud-metadata/token`` file on older VM images (Nebius removed
+   that mount on 2026-09-30). When using a Docker image (``image_id:
+   docker:...``), the metadata service is reachable as SkyPilot runs the
+   container with host networking.
 
    Specify it as a ``<string>`` or a ``<list of single-element dict>`` mapping
    cluster name patterns to service account IDs, as for
