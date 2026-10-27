@@ -1,9 +1,13 @@
 """Nebius cloud adaptor."""
 import asyncio
+import json
 import logging
 import os
 import threading
-from typing import Any, Awaitable, Dict, List, Optional
+import time
+from typing import Any, Awaitable, Dict, List, Optional, Tuple
+import urllib.error
+import urllib.request
 
 from sky import sky_logging
 from sky import skypilot_config
@@ -90,10 +94,57 @@ def domain_path() -> str:
     return '~/.nebius/NEBIUS_DOMAIN.txt'
 
 
-# Token of the service account attached to a Nebius VM, kept fresh by the
-# platform. https://docs.nebius.com/cli/compute-vm
+# Token of the service account attached to a Nebius VM, served by the instance
+# metadata service (IMDS). https://docs.nebius.com/cli/compute-vm
+VM_SERVICE_ACCOUNT_TOKEN_ENDPOINT = (
+    'http://metadata.nebius.internal/v1/iam/sa/token')
+# Legacy fallback for older VM images. Nebius removed this mount on
+# 2026-09-30; new VMs only have the IMDS.
 VM_SERVICE_ACCOUNT_TOKEN_DIR = '/mnt/cloud-metadata'
 VM_SERVICE_ACCOUNT_TOKEN_PATH = f'{VM_SERVICE_ACCOUNT_TOKEN_DIR}/token'
+
+# The probe is made off a Nebius VM too (e.g. on a laptop or an API server
+# without Nebius credentials), where the metadata host does not resolve. Keep
+# the probe short, and remember the result so it is not repeated.
+_IMDS_PROBE_TIMEOUT = 1
+_IMDS_PROBE_FAILURE_TTL = 60
+_imds_probe_lock = threading.Lock()
+# (available, time of the probe in time.monotonic()).
+_imds_probe_result: Optional[Tuple[bool, float]] = None
+
+
+def _probe_imds() -> bool:
+    """Returns whether the IMDS issues a token for an attached service account.
+
+    Does not use proxies from the environment: the metadata service is only
+    reachable directly from the VM.
+    """
+    request = urllib.request.Request(VM_SERVICE_ACCOUNT_TOKEN_ENDPOINT,
+                                     headers={'Metadata': 'true'})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=_IMDS_PROBE_TIMEOUT) as response:
+            payload = json.loads(response.read(64 << 10))
+        return isinstance(payload, dict) and bool(payload.get('access_token'))
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+
+
+def is_imds_available() -> bool:
+    """Whether this machine is a Nebius VM with a service account attached.
+
+    The result is cached per process: for good once the IMDS answered, and for
+    _IMDS_PROBE_FAILURE_TTL seconds after a failure.
+    """
+    global _imds_probe_result
+    with _imds_probe_lock:
+        result = _imds_probe_result
+        if result is not None and (result[0] or time.monotonic() - result[1] <
+                                   _IMDS_PROBE_FAILURE_TTL):
+            return result[0]
+        available = _probe_imds()
+        _imds_probe_result = (available, time.monotonic())
+        return available
 
 
 def credentials_path() -> str:
@@ -271,7 +322,20 @@ def get_iam_token():
 def is_token_or_cred_file_exist():
     return (os.path.exists(os.path.expanduser(iam_token_path())) or
             os.path.exists(os.path.expanduser(credentials_path())) or
-            os.path.exists(VM_SERVICE_ACCOUNT_TOKEN_PATH))
+            _vm_service_account_source() is not None)
+
+
+def _vm_service_account_source() -> Optional[str]:
+    """Where the attached service account's token comes from, if any.
+
+    Only meaningful when no credentials file exists. Prefers the IMDS, then the
+    legacy token file. Returns 'imds', 'file' or None.
+    """
+    if is_imds_available():
+        return 'imds'
+    if os.path.exists(VM_SERVICE_ACCOUNT_TOKEN_PATH):
+        return 'file'
+    return None
 
 
 def get_tenant_id():
@@ -300,7 +364,9 @@ def sdk():
     3. Default credentials path
     4. Token of the service account attached to this Nebius VM, if the
        default credentials file does not exist (e.g. a VM launched with
-       `nebius.remote_identity: serviceaccount-...`)
+       `nebius.remote_identity: serviceaccount-...`). It is read from the
+       instance metadata service, or from the legacy token file of older VM
+       images if the metadata service is not available.
     """
     # 1. Check if credentials path is set in workspace config (highest priority)
     workspace_cred_path = _get_workspace_credentials_path()
@@ -321,10 +387,15 @@ def sdk():
 
     # 3. Fall back to default credentials path (lowest priority)
     default_cred_path = _get_default_credentials_path()
-    if (not os.path.exists(os.path.expanduser(default_cred_path)) and
-            os.path.exists(VM_SERVICE_ACCOUNT_TOKEN_PATH)):
+    if not os.path.exists(os.path.expanduser(default_cred_path)):
         # 4. Running on a Nebius VM with an attached service account.
-        return _sdk(None, None, vm_token_path=VM_SERVICE_ACCOUNT_TOKEN_PATH)
+        vm_source = _vm_service_account_source()
+        if vm_source == 'imds':
+            return _sdk(None,
+                        None,
+                        vm_imds_endpoint=VM_SERVICE_ACCOUNT_TOKEN_ENDPOINT)
+        if vm_source == 'file':
+            return _sdk(None, None, vm_token_path=VM_SERVICE_ACCOUNT_TOKEN_PATH)
     return _sdk(None, default_cred_path)
 
 
@@ -335,13 +406,38 @@ def _user_agent_prefix() -> str:
     return f'skypilot/{__version__}'
 
 
+def _imds_bearer(endpoint: str) -> Any:
+    """Bearer for the token endpoint of the instance metadata service.
+
+    The SDK's IMDS bearer (nebius>=0.6.24) fetches a token for every request,
+    and the service is rate limited, so wrap it in the renewable bearer that
+    caches the token and refreshes it ahead of its expiry. Older SDKs get an
+    equivalent local bearer.
+    """
+    # pylint: disable=import-outside-toplevel
+    from nebius.aio.token import renewable
+    try:
+        from nebius.aio.token import imds
+    except ImportError:
+        from sky.adaptors import nebius_imds as imds
+    return renewable.Bearer(imds.Bearer(endpoint))
+
+
 @annotations.lru_cache(scope='request')
 def _sdk(token: Optional[str],
          cred_path: Optional[str],
-         vm_token_path: Optional[str] = None):
-    # Exactly one of token, cred_path or vm_token_path must be provided.
-    assert [token, cred_path,
-            vm_token_path].count(None) == 2, (token, cred_path, vm_token_path)
+         vm_token_path: Optional[str] = None,
+         vm_imds_endpoint: Optional[str] = None):
+    # Exactly one of token, cred_path, vm_token_path or vm_imds_endpoint must
+    # be provided.
+    assert [token, cred_path, vm_token_path, vm_imds_endpoint
+           ].count(None) == 3, (token, cred_path, vm_token_path,
+                                vm_imds_endpoint)
+    if vm_imds_endpoint is not None:
+        # The bearer caches the token and refreshes it ahead of its expiry.
+        return nebius.sdk.SDK(credentials=_imds_bearer(vm_imds_endpoint),
+                              domain=api_domain(),
+                              user_agent_prefix=_user_agent_prefix())
     if token is not None:
         return nebius.sdk.SDK(credentials=token,
                               domain=api_domain(),
@@ -372,6 +468,13 @@ def clear_sdk_cache() -> None:
     `asyncio.run()` cycle in a single process must reset the client in between.
     """
     _sdk.cache_clear()
+
+
+def clear_imds_probe_cache() -> None:
+    """Forget the result of the metadata service probe."""
+    global _imds_probe_result
+    with _imds_probe_lock:
+        _imds_probe_result = None
 
 
 def get_nebius_credentials(boto3_session):
