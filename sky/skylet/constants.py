@@ -734,6 +734,12 @@ REMOTE_SKIPPED_CLIENT_OVERRIDE_KEYS: List[Tuple[str, ...]] = [
     ('kubernetes', 'allowed_contexts'),
     ('ssh', 'allowed_node_pools'),
     ('slurm', 'allowed_clusters'),
+    # Which Nebius service account and project a cluster gets is set by the
+    # server, so a remote client cannot pick another one (or LOCAL_CREDENTIALS,
+    # i.e. the server's own credentials). The per-workspace values are covered
+    # by ('workspaces',) above.
+    ('nebius', 'remote_identity'),
+    ('nebius', 'region_configs'),
 ]
 
 # Constants for Azure blob storage

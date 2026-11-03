@@ -330,6 +330,92 @@ def test_write_cluster_config_skips_credentials_with_service_account(
     assert variables['service_account_id'] == expected_sa
 
 
+@mock.patch.object(skypilot_config, '_global_config_context',
+                   skypilot_config.ConfigContext())
+@mock.patch('sky.catalog.instance_type_exists', return_value=True)
+@mock.patch('sky.catalog.get_accelerators_from_instance_type',
+            return_value=None)
+@mock.patch('sky.backends.backend_utils._get_yaml_path_from_cluster_name',
+            return_value='/tmp/fake/path')
+@mock.patch('sky.backends.backend_utils._deterministic_cluster_yaml_hash',
+            return_value='fake-hash')
+@mock.patch('sky.utils.common_utils.fill_template')
+@pytest.mark.parametrize('nebius_config, uploads_nebius_credentials', [
+    ({}, True),
+    ({
+        'remote_identity': 'LOCAL_CREDENTIALS'
+    }, True),
+    ({
+        'remote_identity': _SA
+    }, False),
+    ({
+        'remote_identity': [{
+            'other-*': _SA
+        }]
+    }, False),
+    ({
+        'region_configs': {
+            _REGION: {
+                'remote_identity': [{
+                    'team-*': _SA
+                }, {
+                    '*': 'serviceaccount-e00default'
+                }]
+            }
+        }
+    }, False),
+    ({
+        'workspace': {
+            'remote_identity': _SA
+        }
+    }, False),
+])
+def test_write_cluster_config_other_cloud_skips_nebius_credentials(
+        mock_fill_template, mock_hash, mock_path, mock_accs, mock_exists,
+        tmp_path, nebius_config, uploads_nebius_credentials):
+    """A Nebius service account keeps Nebius credentials off other clouds.
+
+    The local credentials are the provisioner's (e.g. the API server's), so a
+    cluster on another cloud must not get them either, wherever in the config
+    the service account is set.
+    """
+    del mock_fill_template, mock_hash, mock_path, mock_accs, mock_exists
+    nebius_config = dict(nebius_config)
+    workspace_config = nebius_config.pop('workspace', None)
+    config = {'nebius': nebius_config} if nebius_config else {}
+    if workspace_config is not None:
+        config['workspaces'] = {'default': {'nebius': workspace_config}}
+    config_path = tmp_path / 'config.yaml'
+    yaml_utils.dump_yaml(str(config_path), config)
+    excluded = []
+
+    def _credential_mounts(excluded_clouds):
+        excluded.append(set(excluded_clouds))
+        return {}
+
+    with mock.patch.dict(
+            os.environ,
+        {skypilot_config.ENV_VAR_SKYPILOT_CONFIG: str(config_path)}), \
+            mock.patch('sky.check.get_cloud_credential_file_mounts',
+                       side_effect=_credential_mounts):
+        skypilot_config.reload_config()
+        backend_utils.write_cluster_config(
+            to_provision=resources_lib.Resources(cloud=clouds.Verda(),
+                                                 instance_type='1V100.6V'),
+            num_nodes=1,
+            cluster_config_template='verda-ray.yml.j2',
+            cluster_name='team-a-cluster',
+            local_wheel_path=pathlib.Path('/tmp/fake'),
+            wheel_hash='fake-hash',
+            region=clouds.Region('FIN-01'),
+            zones=None,
+            dryrun=True,
+            keep_launch_fields_in_existing_config=True)
+
+    assert (not clouds.cloud_in_iterable(
+        clouds.Nebius(), excluded[0])) == uploads_nebius_credentials
+
+
 @nebius_sdk_required
 @pytest.mark.parametrize('service_account_id', [None, _SA])
 def test_launch_sets_instance_service_account(service_account_id):
@@ -674,3 +760,185 @@ class TestLocalImdsBearer:
         finally:
             server.shutdown()
             server.server_close()
+
+
+_TEAM_A_SA = 'serviceaccount-e00teama'
+_DEFAULT_SA = 'serviceaccount-e00default'
+_SERVER_PROJECT = 'project-e00server'
+
+
+class TestClientOverride:
+    """A remote client cannot override the server's Nebius identity."""
+
+    @pytest.fixture(autouse=True)
+    def _server_config(self, monkeypatch, tmp_path):
+        config_path = tmp_path / 'config.yaml'
+        yaml_utils.dump_yaml(
+            str(config_path), {
+                'nebius': {
+                    'tenant_id': 'tenant-e00server',
+                    'region_configs': {
+                        _REGION: {
+                            'project_id': _SERVER_PROJECT,
+                            'remote_identity': [{
+                                'team-a-*': _TEAM_A_SA
+                            }, {
+                                '*': _DEFAULT_SA
+                            }],
+                        }
+                    },
+                },
+                'workspaces': {
+                    'default': {
+                        'nebius': {
+                            'tenant_id': 'tenant-e00server',
+                        }
+                    }
+                },
+            })
+        monkeypatch.setattr(skypilot_config, '_global_config_context',
+                            skypilot_config.ConfigContext())
+        monkeypatch.setattr(skypilot_config, '_GLOBAL_CONFIG_PATH',
+                            str(config_path))
+        monkeypatch.delenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG,
+                           raising=False)
+        monkeypatch.delenv(skypilot_config.ENV_VAR_GLOBAL_CONFIG, raising=False)
+        skypilot_config.reload_config()
+        yield
+        monkeypatch.undo()
+        skypilot_config.reload_config()
+
+    @staticmethod
+    def _resolved():
+        return (
+            nebius._get_service_account_id(_REGION, 'team-b-train', None),
+            nebius._get_service_account_id('eu-west1', 'team-b-train', None),
+            nebius_utils.get_project_by_region(_REGION),
+            # What write_cluster_config reads to decide on uploading the local
+            # credentials to a Nebius cluster in a region without its own
+            # remote_identity.
+            skypilot_config.get_effective_workspace_region_config(
+                cloud='nebius', keys=('remote_identity',), region='eu-west1'),
+        )
+
+    _SERVER_VALUES = (_DEFAULT_SA, None, _SERVER_PROJECT, None)
+
+    @pytest.mark.parametrize('client_config', [
+        {
+            'nebius': {
+                'region_configs': {
+                    _REGION: {
+                        'remote_identity': 'LOCAL_CREDENTIALS'
+                    }
+                }
+            }
+        },
+        {
+            'nebius': {
+                'region_configs': {
+                    _REGION: {
+                        'remote_identity': [{
+                            '*': _TEAM_A_SA
+                        }]
+                    }
+                }
+            }
+        },
+        {
+            'nebius': {
+                'region_configs': {
+                    _REGION: {
+                        'project_id': 'project-e00other'
+                    }
+                }
+            }
+        },
+        {
+            'nebius': {
+                'region_configs': {
+                    'eu-west1': {
+                        'remote_identity': _TEAM_A_SA
+                    }
+                }
+            }
+        },
+        {
+            'nebius': {
+                'remote_identity': _TEAM_A_SA
+            }
+        },
+        {
+            'nebius': {
+                'remote_identity': 'LOCAL_CREDENTIALS'
+            }
+        },
+        {
+            'workspaces': {
+                'default': {
+                    'nebius': {
+                        'remote_identity': _TEAM_A_SA
+                    }
+                }
+            }
+        },
+    ])
+    def test_ignored_on_remote_request(self, client_config):
+        with skypilot_config.override_skypilot_config(client_config,
+                                                      from_loopback=False):
+            assert self._resolved() == self._SERVER_VALUES
+            # The server's value still applies to the matching team.
+            assert nebius._get_service_account_id(_REGION, 'team-a-train',
+                                                  None) == _TEAM_A_SA
+            # Nebius credentials still stay off other clouds.
+            assert nebius.Nebius.excludes_credentials_from_other_clouds()
+
+    def test_other_team_service_account_cannot_be_selected(self):
+        client_config = {
+            'nebius': {
+                'remote_identity': _TEAM_A_SA,
+                'region_configs': {
+                    _REGION: {
+                        'remote_identity': [{
+                            'team-b-*': _TEAM_A_SA
+                        }]
+                    }
+                },
+            },
+            'workspaces': {
+                'default': {
+                    'nebius': {
+                        'remote_identity': _TEAM_A_SA
+                    }
+                }
+            },
+        }
+        with skypilot_config.override_skypilot_config(client_config,
+                                                      from_loopback=False):
+            assert nebius._get_service_account_id(_REGION, 'team-b-train',
+                                                  None) == _DEFAULT_SA
+
+    def test_other_nebius_keys_still_apply_on_remote_request(self):
+        with skypilot_config.override_skypilot_config(
+            {'nebius': {
+                'use_static_ip_address': True
+            }}, from_loopback=False):
+            assert skypilot_config.get_nested(
+                ('nebius', 'use_static_ip_address'), None) is True
+            assert self._resolved() == self._SERVER_VALUES
+
+    def test_loopback_client_still_layers(self):
+        client_config = {
+            'nebius': {
+                'remote_identity': _TEAM_A_SA,
+                'region_configs': {
+                    _REGION: {
+                        'project_id': 'project-e00local',
+                        'remote_identity': 'LOCAL_CREDENTIALS',
+                    }
+                },
+            }
+        }
+        with skypilot_config.override_skypilot_config(client_config,
+                                                      from_loopback=True):
+            assert self._resolved() == (None, _TEAM_A_SA, 'project-e00local',
+                                        _TEAM_A_SA)

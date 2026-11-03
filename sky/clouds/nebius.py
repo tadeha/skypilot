@@ -121,6 +121,33 @@ def _get_service_account_id(
     return None
 
 
+def _is_service_account_configured() -> bool:
+    """Whether `nebius.remote_identity` attaches a service account anywhere.
+
+    Checks the cloud-level value and every region in `region_configs`, for
+    the active workspace and the global config, and any cluster name pattern.
+    """
+    regions = skypilot_config.get_workspace_cloud('nebius').get(
+        'region_configs', None) or {}
+    for region in [None, *regions]:
+        remote_identity = skypilot_config.get_effective_workspace_region_config(
+            cloud='nebius',
+            region=region,
+            keys=('remote_identity',),
+            default_value=None)
+        if isinstance(remote_identity, str):
+            remote_identity = [{'*': remote_identity}]
+        if not isinstance(remote_identity, list):
+            continue
+        for profile in remote_identity:
+            if any(
+                    isinstance(identity, str) and
+                    identity.startswith(_SERVICE_ACCOUNT_ID_PREFIX)
+                    for identity in profile.values()):
+                return True
+    return False
+
+
 @registry.CLOUD_REGISTRY.register
 class Nebius(clouds.Cloud):
     """Nebius GPU Cloud"""
@@ -148,6 +175,16 @@ class Nebius(clouds.Cloud):
     # An existing service account can be attached to the VMs via
     # `nebius.remote_identity: serviceaccount-...`.
     _SUPPORTS_SERVICE_ACCOUNT_ON_REMOTE = True
+
+    @classmethod
+    def excludes_credentials_from_other_clouds(cls) -> bool:
+        """Whether to keep Nebius credentials off clusters on other clouds.
+
+        True when `nebius.remote_identity` attaches a service account, so the
+        local Nebius credentials (e.g. the API server's own) are not handed to
+        any cluster, like `NO_UPLOAD`.
+        """
+        return _is_service_account_configured()
 
     _BEST_DISK_TIER = resources_utils.DiskTier.HIGH
     _DEFAULT_DISK_TIER = resources_utils.DiskTier.MEDIUM
